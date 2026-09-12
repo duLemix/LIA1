@@ -1,12 +1,13 @@
-Repositório de conteúdos e projetos de LIA1 - 2026_1
-_____________________________________________________
+# Laboratório de Inovação e Automação
 
-Fazer Fork
+Este repositóiro guarda os itens desenvolvidos durante e para os trabalhos e
+entregas da disciplina.
 
-Criar uma pasta -> "Entregas - Seu nome e Sobrenome"
+## Atividades
 
-Fazer Pull Request
+As atividades marcadas para entrega estão localizadas nos diretórios com o nome
+`Entregas - Emilio Sanhueza/Atividade N`, sinalizando o número de entrega.
+Demais projetos estão em `Entregas - Emilio Sanhueza/Outras Atividades`,
+nomeadas por tema desenvolvido.
 
-Fazer Commit
-
-Bom Trabalho!
+Cada trabalho tem seu README.md identificando propósito e uso.
