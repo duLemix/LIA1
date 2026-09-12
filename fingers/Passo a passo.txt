@@ -1,0 +1,27 @@
+Acessar as variáveis do sistema
+
+0. where python - instalar o python
+
+1. Criar a pasta do projeto
+
+2. Criar a env do projeto
+- cd caminho\da\pasta\do\projeto
+- python -m venv .venv (python global)
+
+3. Ativar a env
+- .venv\Scripts\activate.bat
+
+4. Desativar a env
+- .venv\Scripts\deactivate.bat
+
+5. Verificar o que tem instalado
+- pip list
+
+6. Gerar o requirement.txt
+- pip freeze > requirements.txt
+
+7. Instalar o que deve ser instalado
+- pip install opencv-python
+- pip install mediapipe
+
+8. Executar o projeto!
