@@ -20,6 +20,11 @@ Notebook de visão computacional usando o _framework_ **Ultralytics YOLO26**, qu
 ## Contexto dos demais arquivos
 
 - **`objects-phone-v3.ndjson`** – Dataset anotado (formato NDJSON) com frames de vídeo de vigilância urbana marcando pessoas usando celulares, baixado da Ultralytics Platform e convertido para o formato YOLO pelo notebook.
-- **`yolo_video_input.mp4`** – Vídeo de entrada usado na etapa final de inferência, convertido e processado para gerar o vídeo anotado com as detecções.
 
 Este notebook compõe a **Atividade 2** do projeto da disciplina, complementando a atividade anterior de visualização de dados com aprendizado de máquina aplicado.
+
+---
+
+## TODO
+
+Adicionar link para vídeo de teste.
