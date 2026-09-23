@@ -1,7 +1,13 @@
 "use client";
 
-import type { ChangeEvent } from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import type { ChangeEvent, PointerEvent as ReactPointerEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 const DEFAULT_MODEL_PATH = "/model_best.onnx";
 const SAMPLE_MEDIA = [
@@ -12,7 +18,10 @@ const SAMPLE_MEDIA = [
 ] as const;
 const DEFAULT_MODEL_SIZE = 640;
 const NMS_IOU_THRESHOLD = 0.45;
-const VIDEO_INTERVAL_MS = 100;
+const VIDEO_INFERENCE_INTERVAL_MS = 80;
+const MIN_MEDIA_ZOOM = 0.5;
+const MAX_MEDIA_ZOOM = 4;
+const MEDIA_ZOOM_STEP = 0.15;
 const DEFAULT_CLASSES = [
   "person",
   "bicycle",
@@ -74,7 +83,9 @@ type SessionLike = {
   customMetadataMap?: unknown;
 };
 type OrtLike = {
-  env: { wasm: { wasmPaths: string; numThreads: number } };
+  env: {
+    wasm: { wasmPaths: string; numThreads: number; proxy: boolean };
+  };
   Tensor: new (
     type: "float32",
     data: Float32Array,
@@ -88,6 +99,21 @@ type OrtLike = {
   };
 };
 type TranslationMap = Record<number, { en: string; pt: string }>;
+type ZoomAnchor = { clientX: number; clientY: number };
+type PendingZoomAnchor = {
+  contentRatioX: number;
+  contentRatioY: number;
+  viewportX: number;
+  viewportY: number;
+};
+type MediaFrameSize = { width: number; height: number };
+type PanStart = {
+  pointerId: number;
+  x: number;
+  y: number;
+  scrollLeft: number;
+  scrollTop: number;
+};
 
 const normalizeClassName = (name: string) =>
   name.trim().toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
@@ -225,6 +251,9 @@ const yieldToUi = () =>
 
 const parseClasses = (value: string) =>
   value.split(",").map((name) => name.trim()).filter(Boolean);
+
+const clampMediaZoom = (value: number) =>
+  Math.min(MAX_MEDIA_ZOOM, Math.max(MIN_MEDIA_ZOOM, value));
 
 const parseMetadataValue = (value: unknown): string[] | null => {
   if (Array.isArray(value)) {
@@ -595,6 +624,8 @@ const readModelFile = (file: File) =>
 export default function Page() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const mediaFrameRef = useRef<HTMLDivElement | null>(null);
   const imageRef = useRef<HTMLImageElement | null>(null);
   const offscreenRef = useRef<HTMLCanvasElement | null>(null);
   const ortRef = useRef<OrtLike | null>(null);
@@ -614,8 +645,12 @@ export default function Page() {
   const classesRef = useRef(DEFAULT_CLASSES);
   const languageRef = useRef<Language>("en");
   const confidenceRef = useRef(0.4);
+  const mediaZoomRef = useRef(1);
+  const pendingZoomAnchorRef = useRef<PendingZoomAnchor | null>(null);
+  const panStartRef = useRef<PanStart | null>(null);
   const mediaKindRef = useRef<MediaKind>(null);
-  const frameRef = useRef<number | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const videoFrameRef = useRef<number | null>(null);
   const lastInferenceRef = useRef(0);
   const inferenceBusyRef = useRef(false);
   const objectUrlRef = useRef<string | null>(null);
@@ -633,6 +668,45 @@ export default function Page() {
   const [language, setLanguage] = useState<Language>("en");
   const [confidence, setConfidence] = useState(0.4);
   const [hasMedia, setHasMedia] = useState(false);
+  const [activeMediaKind, setActiveMediaKind] = useState<MediaKind>(null);
+  const [mediaZoom, setMediaZoom] = useState(1);
+  const [mediaFrameSize, setMediaFrameSize] = useState<MediaFrameSize>({
+    width: 0,
+    height: 0,
+  });
+  const [isPanning, setIsPanning] = useState(false);
+
+  const applyMediaZoom = useCallback((value: number, anchor?: ZoomAnchor) => {
+    const nextZoom = Math.round(clampMediaZoom(value) * 100) / 100;
+    if (nextZoom === mediaZoomRef.current) {
+      return;
+    }
+    const viewport = viewportRef.current;
+    if (viewport) {
+      const bounds = viewport.getBoundingClientRect();
+      const viewportX = anchor
+        ? anchor.clientX - bounds.left
+        : viewport.clientWidth / 2;
+      const viewportY = anchor
+        ? anchor.clientY - bounds.top
+        : viewport.clientHeight / 2;
+      pendingZoomAnchorRef.current = {
+        contentRatioX: (viewport.scrollLeft + viewportX) /
+          Math.max(1, viewport.scrollWidth),
+        contentRatioY: (viewport.scrollTop + viewportY) /
+          Math.max(1, viewport.scrollHeight),
+        viewportX,
+        viewportY,
+      };
+    }
+    mediaZoomRef.current = nextZoom;
+    setMediaZoom(nextZoom);
+  }, []);
+
+  const adjustMediaZoom = useCallback(
+    (amount: number) => applyMediaZoom(mediaZoomRef.current + amount),
+    [applyMediaZoom],
+  );
 
   const releaseObjectUrl = useCallback(() => {
     if (objectUrlRef.current) {
@@ -642,12 +716,17 @@ export default function Page() {
   }, []);
 
   const stopVideo = useCallback(() => {
-    if (frameRef.current !== null) {
-      cancelAnimationFrame(frameRef.current);
-      frameRef.current = null;
+    if (animationFrameRef.current !== null) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+    if (videoFrameRef.current !== null && videoRef.current) {
+      videoRef.current.cancelVideoFrameCallback(videoFrameRef.current);
+      videoFrameRef.current = null;
     }
     videoRef.current?.pause();
     inferenceBusyRef.current = false;
+    lastInferenceRef.current = 0;
   }, []);
 
   const draw = useCallback((providedSource?: Drawable) => {
@@ -673,7 +752,11 @@ export default function Page() {
       return;
     }
     context.clearRect(0, 0, canvas.width, canvas.height);
-    context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    // Video stays on its own composited layer. The canvas only paints the
+    // overlay, so inference work can never reduce the media playback rate.
+    if (!(source instanceof HTMLVideoElement)) {
+      context.drawImage(source, 0, 0, canvas.width, canvas.height);
+    }
     context.lineWidth = Math.max(2, canvas.width / 640);
     context.textBaseline = "middle";
     context.font = Math.max(13, Math.round(canvas.width / 70)) +
@@ -731,6 +814,127 @@ export default function Page() {
   useEffect(() => {
     redrawRef.current = () => draw();
   }, [draw]);
+
+  useLayoutEffect(() => {
+    const viewport = viewportRef.current;
+    const anchor = pendingZoomAnchorRef.current;
+    if (!viewport || !anchor) {
+      return;
+    }
+    pendingZoomAnchorRef.current = null;
+    viewport.scrollLeft =
+      anchor.contentRatioX * viewport.scrollWidth - anchor.viewportX;
+    viewport.scrollTop =
+      anchor.contentRatioY * viewport.scrollHeight - anchor.viewportY;
+  }, [mediaZoom]);
+
+  useEffect(() => {
+    const frame = mediaFrameRef.current;
+    if (!frame || !hasMedia) {
+      return;
+    }
+    const updateFrameSize = () => {
+      const nextSize = {
+        width: frame.offsetWidth,
+        height: frame.offsetHeight,
+      };
+      setMediaFrameSize((current) =>
+        current.width === nextSize.width && current.height === nextSize.height
+          ? current
+          : nextSize
+      );
+    };
+    updateFrameSize();
+    const observer = new ResizeObserver(updateFrameSize);
+    observer.observe(frame);
+    return () => observer.disconnect();
+  }, [activeMediaKind, hasMedia]);
+
+  useEffect(() => {
+    const handleZoomShortcut = (event: KeyboardEvent) => {
+      if (!hasMedia || (!event.ctrlKey && !event.metaKey)) {
+        return;
+      }
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        adjustMediaZoom(MEDIA_ZOOM_STEP);
+      } else if (event.key === "-") {
+        event.preventDefault();
+        adjustMediaZoom(-MEDIA_ZOOM_STEP);
+      } else if (event.key === "0") {
+        event.preventDefault();
+        applyMediaZoom(1);
+      }
+    };
+    window.addEventListener("keydown", handleZoomShortcut);
+    return () => window.removeEventListener("keydown", handleZoomShortcut);
+  }, [adjustMediaZoom, applyMediaZoom, hasMedia]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    let pinchStartDistance = 0;
+    let pinchStartZoom = 1;
+    const touchDistance = (touches: TouchList) => {
+      const horizontal = touches[0].clientX - touches[1].clientX;
+      const vertical = touches[0].clientY - touches[1].clientY;
+      return Math.hypot(horizontal, vertical);
+    };
+    const handleWheel = (event: WheelEvent) => {
+      if (!hasMedia || (!event.ctrlKey && !event.metaKey)) {
+        return;
+      }
+      event.preventDefault();
+      const factor = Math.exp(-event.deltaY * 0.002);
+      applyMediaZoom(mediaZoomRef.current * factor, {
+        clientX: event.clientX,
+        clientY: event.clientY,
+      });
+    };
+    const handleTouchStart = (event: TouchEvent) => {
+      if (!hasMedia || event.touches.length !== 2) {
+        return;
+      }
+      event.preventDefault();
+      pinchStartDistance = touchDistance(event.touches);
+      pinchStartZoom = mediaZoomRef.current;
+    };
+    const handleTouchMove = (event: TouchEvent) => {
+      if (event.touches.length !== 2 || pinchStartDistance === 0) {
+        return;
+      }
+      event.preventDefault();
+      const midpoint = {
+        clientX: (event.touches[0].clientX + event.touches[1].clientX) / 2,
+        clientY: (event.touches[0].clientY + event.touches[1].clientY) / 2,
+      };
+      applyMediaZoom(
+        pinchStartZoom * (touchDistance(event.touches) / pinchStartDistance),
+        midpoint,
+      );
+    };
+    const handleTouchEnd = () => {
+      pinchStartDistance = 0;
+    };
+    viewport.addEventListener("wheel", handleWheel, { passive: false });
+    viewport.addEventListener("touchstart", handleTouchStart, {
+      passive: false,
+    });
+    viewport.addEventListener("touchmove", handleTouchMove, {
+      passive: false,
+    });
+    viewport.addEventListener("touchend", handleTouchEnd);
+    viewport.addEventListener("touchcancel", handleTouchEnd);
+    return () => {
+      viewport.removeEventListener("wheel", handleWheel);
+      viewport.removeEventListener("touchstart", handleTouchStart);
+      viewport.removeEventListener("touchmove", handleTouchMove);
+      viewport.removeEventListener("touchend", handleTouchEnd);
+      viewport.removeEventListener("touchcancel", handleTouchEnd);
+    };
+  }, [applyMediaZoom, hasMedia]);
 
   const preprocess = useCallback(
     async (source: Drawable, ort: OrtLike) => {
@@ -875,16 +1079,13 @@ export default function Page() {
       return;
     }
     const renderFrame = (timestamp: number) => {
-      if (
-        mediaKindRef.current !== "video" ||
-        video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
-      ) {
-        frameRef.current = requestAnimationFrame(renderFrame);
+      if (mediaKindRef.current !== "video") {
         return;
       }
-      draw(video);
       if (
-        timestamp - lastInferenceRef.current >= VIDEO_INTERVAL_MS &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        timestamp - lastInferenceRef.current >=
+          VIDEO_INFERENCE_INTERVAL_MS &&
         !inferenceBusyRef.current &&
         sessionRef.current
       ) {
@@ -894,13 +1095,20 @@ export default function Page() {
           inferenceBusyRef.current = false;
         });
       }
-      frameRef.current = requestAnimationFrame(renderFrame);
+      scheduleNextFrame();
     };
-    if (frameRef.current !== null) {
-      cancelAnimationFrame(frameRef.current);
-    }
+    const scheduleNextFrame = () => {
+      if (typeof video.requestVideoFrameCallback === "function") {
+        videoFrameRef.current = video.requestVideoFrameCallback(
+          (timestamp) => renderFrame(timestamp),
+        );
+      } else {
+        animationFrameRef.current = requestAnimationFrame(renderFrame);
+      }
+    };
     lastInferenceRef.current = 0;
-    frameRef.current = requestAnimationFrame(renderFrame);
+    draw(video);
+    scheduleNextFrame();
   }, [draw, infer]);
 
   const loadModel = useCallback(
@@ -976,6 +1184,7 @@ export default function Page() {
   const loadImage = useCallback(
     (url: string, objectUrl: boolean) => {
       stopVideo();
+      applyMediaZoom(1);
       releaseObjectUrl();
       if (objectUrl) {
         objectUrlRef.current = url;
@@ -984,6 +1193,7 @@ export default function Page() {
       classificationsRef.current = [];
       imageRef.current = null;
       mediaKindRef.current = "image";
+      setActiveMediaKind("image");
       setHasMedia(true);
       const image = new Image();
       image.decoding = "async";
@@ -998,12 +1208,13 @@ export default function Page() {
       };
       image.src = url;
     },
-    [draw, infer, releaseObjectUrl, stopVideo],
+    [applyMediaZoom, draw, infer, releaseObjectUrl, stopVideo],
   );
 
   const loadVideo = useCallback(
     (url: string, objectUrl: boolean) => {
       stopVideo();
+      applyMediaZoom(1);
       releaseObjectUrl();
       if (objectUrl) {
         objectUrlRef.current = url;
@@ -1012,6 +1223,7 @@ export default function Page() {
       classificationsRef.current = [];
       imageRef.current = null;
       mediaKindRef.current = "video";
+      setActiveMediaKind("video");
       setHasMedia(true);
       const video = videoRef.current;
       if (!video) {
@@ -1035,7 +1247,7 @@ export default function Page() {
       };
       video.load();
     },
-    [releaseObjectUrl, startVideo, stopVideo],
+    [applyMediaZoom, releaseObjectUrl, startVideo, stopVideo],
   );
 
   const loadMedia = useCallback(
@@ -1059,10 +1271,14 @@ export default function Page() {
         }
         const ort = imported as unknown as OrtLike;
         ort.env.wasm.wasmPaths =
-          "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
+          "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
         ort.env.wasm.numThreads = 1;
+        ort.env.wasm.proxy = true;
         ortRef.current = ort;
         await loadModel(DEFAULT_MODEL_PATH, "Default model");
+        if (!cancelled && mediaKindRef.current === null) {
+          loadImage(SAMPLE_MEDIA[1].path, false);
+        }
       } catch (error) {
         console.error(error);
         if (!cancelled) {
@@ -1085,7 +1301,7 @@ export default function Page() {
         clearTimeout(imageTimerRef.current);
       }
     };
-  }, [loadModel, releaseObjectUrl, stopVideo]);
+  }, [loadImage, loadModel, releaseObjectUrl, stopVideo]);
 
   useEffect(() => {
     const translationVersion = classEditVersionRef.current + 1;
@@ -1285,6 +1501,51 @@ export default function Page() {
     }
   };
 
+  const startPanning = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const viewport = viewportRef.current;
+    if (
+      !viewport ||
+      !hasMedia ||
+      mediaZoom <= 1 ||
+      event.pointerType === "touch" ||
+      event.button !== 0
+    ) {
+      return;
+    }
+    event.preventDefault();
+    viewport.setPointerCapture(event.pointerId);
+    panStartRef.current = {
+      pointerId: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+    };
+    setIsPanning(true);
+  };
+
+  const continuePanning = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const viewport = viewportRef.current;
+    const start = panStartRef.current;
+    if (!viewport || !start || start.pointerId !== event.pointerId) {
+      return;
+    }
+    viewport.scrollLeft = start.scrollLeft - (event.clientX - start.x);
+    viewport.scrollTop = start.scrollTop - (event.clientY - start.y);
+  };
+
+  const stopPanning = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const viewport = viewportRef.current;
+    if (panStartRef.current?.pointerId !== event.pointerId) {
+      return;
+    }
+    if (viewport?.hasPointerCapture(event.pointerId)) {
+      viewport.releasePointerCapture(event.pointerId);
+    }
+    panStartRef.current = null;
+    setIsPanning(false);
+  };
+
   const statusStyles: Record<
     Status,
     { label: string; style: string; dot: string }
@@ -1327,6 +1588,10 @@ export default function Page() {
       sampleVideo: "Video",
       viewport: "Detection viewport",
       classificationViewport: "Classification viewport",
+      zoomIn: "Zoom in",
+      zoomOut: "Zoom out",
+      resetZoom: "Reset zoom",
+      zoomHelp: "Pinch or Ctrl/⌘ +/− to zoom · drag to move",
       empty: "Select an image, video, or sample to begin detection.",
       defaultModel: "Default",
     }
@@ -1345,6 +1610,10 @@ export default function Page() {
       sampleVideo: "Vídeo",
       viewport: "Área de detecção",
       classificationViewport: "Área de classificação",
+      zoomIn: "Ampliar",
+      zoomOut: "Reduzir",
+      resetZoom: "Restaurar zoom",
+      zoomHelp: "Use pinça ou Ctrl/⌘ +/− para ampliar · arraste para mover",
       empty: "Selecione uma imagem, vídeo ou exemplo para iniciar.",
       defaultModel: "Padrão",
     };
@@ -1531,19 +1800,71 @@ export default function Page() {
           </aside>
 
           <section className="flex min-h-[560px] min-w-0 flex-col p-4 sm:p-6 lg:p-8">
-            <div className="mb-3 flex items-center justify-between gap-4">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold uppercase tracking-wider text-[#d5c4a1]">
                 {modelKind === "classification"
                   ? text.classificationViewport
                   : text.viewport}
               </h2>
-              <span className="font-mono text-xs text-[#7c6f64]">
-                {modelKind === "classification"
-                  ? "WASM · 1 thread · softmax"
-                  : "WASM · 1 thread · NMS 0.45"}
-              </span>
+              <div className="flex items-center gap-3">
+                <span className="hidden font-mono text-xs text-[#7c6f64] sm:inline">
+                  {modelKind === "classification"
+                    ? "WASM worker · softmax"
+                    : "WASM worker · NMS 0.45"}
+                </span>
+                <div
+                  className="flex items-center rounded-lg border border-[#504945] bg-[#282828] p-1"
+                  aria-label="Media zoom controls"
+                >
+                  <button
+                    type="button"
+                    aria-label={text.zoomOut}
+                    title={text.zoomOut + " (Ctrl/⌘ −)"}
+                    disabled={!hasMedia || mediaZoom <= MIN_MEDIA_ZOOM}
+                    onClick={() => adjustMediaZoom(-MEDIA_ZOOM_STEP)}
+                    className="flex h-7 w-7 items-center justify-center rounded text-lg leading-none text-[#d5c4a1] transition hover:bg-[#3c3836] hover:text-[#fabd2f] disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    −
+                  </button>
+                  <button
+                    type="button"
+                    title={text.resetZoom + " (Ctrl/⌘ 0)"}
+                    disabled={!hasMedia}
+                    onClick={() => applyMediaZoom(1)}
+                    className="min-w-14 rounded px-1.5 py-1 font-mono text-[11px] text-[#bdae93] transition hover:bg-[#3c3836] hover:text-[#fbf1c7] disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    {Math.round(mediaZoom * 100)}%
+                  </button>
+                  <button
+                    type="button"
+                    aria-label={text.zoomIn}
+                    title={text.zoomIn + " (Ctrl/⌘ +)"}
+                    disabled={!hasMedia || mediaZoom >= MAX_MEDIA_ZOOM}
+                    onClick={() => adjustMediaZoom(MEDIA_ZOOM_STEP)}
+                    className="flex h-7 w-7 items-center justify-center rounded text-lg leading-none text-[#d5c4a1] transition hover:bg-[#3c3836] hover:text-[#fabd2f] disabled:cursor-not-allowed disabled:opacity-30"
+                  >
+                    +
+                  </button>
+                </div>
+              </div>
             </div>
-            <div className="relative flex min-h-[480px] flex-1 items-center justify-center overflow-hidden rounded-xl border border-[#504945] bg-[#0d0e0f] shadow-2xl shadow-black/30">
+            <div
+              ref={viewportRef}
+              onPointerDown={startPanning}
+              onPointerMove={continuePanning}
+              onPointerUp={stopPanning}
+              onPointerCancel={stopPanning}
+              onLostPointerCapture={stopPanning}
+              className={
+                "relative min-h-[480px] flex-1 overflow-auto overscroll-contain rounded-xl border border-[#504945] bg-[#0d0e0f] shadow-2xl shadow-black/30 " +
+                (hasMedia && mediaZoom > 1
+                  ? isPanning
+                    ? "cursor-grabbing select-none"
+                    : "cursor-grab"
+                  : "")
+              }
+              style={{ touchAction: "pan-x pan-y" }}
+            >
               {!hasMedia && (
                 <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center p-8 text-center">
                   <div>
@@ -1556,25 +1877,58 @@ export default function Page() {
                   </div>
                 </div>
               )}
-              <video
-                ref={videoRef}
-                className="hidden"
-                muted
-                loop
-                playsInline
-                preload="metadata"
-              />
-              <canvas
-                ref={canvasRef}
-                width={640}
-                height={480}
-                aria-label={modelKind === "classification"
-                  ? "Image classification output"
-                  : "YOLO object detection output"}
-                className={"block max-h-[calc(100vh-190px)] max-w-full object-contain " +
-                  (hasMedia ? "opacity-100" : "opacity-0")}
-                style={{ width: "auto", height: "auto" }}
-              />
+              {hasMedia && (
+                <div className="pointer-events-none sticky left-0 top-3 z-20 flex h-0 w-full justify-center px-3">
+                  <span className="rounded-full border border-white/10 bg-[#1d2021]/85 px-3 py-1.5 font-mono text-[10px] text-[#bdae93] shadow-lg shadow-black/30 backdrop-blur-sm sm:text-[11px]">
+                    {text.zoomHelp}
+                  </span>
+                </div>
+              )}
+              <div
+                className="grid min-h-full min-w-full place-items-center p-4"
+                style={{
+                  width: mediaFrameSize.width
+                    ? `max(100%, ${Math.ceil(mediaFrameSize.width * mediaZoom) + 32}px)`
+                    : "100%",
+                  height: mediaFrameSize.height
+                    ? `max(100%, ${Math.ceil(mediaFrameSize.height * mediaZoom) + 32}px)`
+                    : "100%",
+                }}
+              >
+                <div
+                  ref={mediaFrameRef}
+                  className="relative inline-flex max-h-[calc(100vh-190px)] max-w-full items-center justify-center will-change-transform"
+                  style={{ transform: `scale(${mediaZoom})` }}
+                >
+                  <video
+                    ref={videoRef}
+                    className={activeMediaKind === "video"
+                      ? "block max-h-[calc(100vh-190px)] max-w-full object-contain"
+                      : "hidden"}
+                    muted
+                    loop
+                    playsInline
+                    preload="auto"
+                  />
+                  <canvas
+                    ref={canvasRef}
+                    width={640}
+                    height={480}
+                    aria-label={modelKind === "classification"
+                      ? "Image classification output"
+                      : "YOLO object detection output"}
+                    className={
+                      (activeMediaKind === "video"
+                        ? "pointer-events-none absolute inset-0 h-full w-full"
+                        : "block max-h-[calc(100vh-190px)] max-w-full object-contain") +
+                      (hasMedia ? " opacity-100" : " opacity-0")
+                    }
+                    style={activeMediaKind === "video"
+                      ? undefined
+                      : { width: "auto", height: "auto" }}
+                  />
+                </div>
+              </div>
             </div>
           </section>
         </div>

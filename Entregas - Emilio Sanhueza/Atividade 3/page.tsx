@@ -12,7 +12,6 @@ const SAMPLE_MEDIA = [
 ] as const;
 const DEFAULT_MODEL_SIZE = 640;
 const NMS_IOU_THRESHOLD = 0.45;
-const VIDEO_INTERVAL_MS = 100;
 const DEFAULT_CLASSES = [
   "person",
   "bicycle",
@@ -616,7 +615,6 @@ export default function Page() {
   const confidenceRef = useRef(0.4);
   const mediaKindRef = useRef<MediaKind>(null);
   const frameRef = useRef<number | null>(null);
-  const lastInferenceRef = useRef(0);
   const inferenceBusyRef = useRef(false);
   const objectUrlRef = useRef<string | null>(null);
   const loadSequenceRef = useRef(0);
@@ -874,7 +872,7 @@ export default function Page() {
     if (!video) {
       return;
     }
-    const renderFrame = (timestamp: number) => {
+    const renderFrame = () => {
       if (
         mediaKindRef.current !== "video" ||
         video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA
@@ -884,11 +882,9 @@ export default function Page() {
       }
       draw(video);
       if (
-        timestamp - lastInferenceRef.current >= VIDEO_INTERVAL_MS &&
         !inferenceBusyRef.current &&
         sessionRef.current
       ) {
-        lastInferenceRef.current = timestamp;
         inferenceBusyRef.current = true;
         void infer(video, false).finally(() => {
           inferenceBusyRef.current = false;
@@ -899,7 +895,6 @@ export default function Page() {
     if (frameRef.current !== null) {
       cancelAnimationFrame(frameRef.current);
     }
-    lastInferenceRef.current = 0;
     frameRef.current = requestAnimationFrame(renderFrame);
   }, [draw, infer]);
 
